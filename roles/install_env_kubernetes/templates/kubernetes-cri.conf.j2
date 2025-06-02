@@ -1,0 +1,5 @@
+net.bridge.bridge-nf-call-iptables = {{ iptables | default(1) }}
+net.ipv4.ip_forward = {{ ipv4_forward | default(1) }}
+net.bridge.bridge-nf-call-ip6tables = {{ ip6tables | default(1) }}
+net.ipv6.conf.all.forwarding = {{ ipv6_forward | default(1) }}
+

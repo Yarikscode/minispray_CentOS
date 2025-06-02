@@ -1,0 +1,7 @@
+#SPDX-License-Identifier: MIT-0
+---
+# vars file for install_env_kubernetes
+    centos_version: 9
+    kubetools_version: 1.31.7
+    kuber_repo_version: v1.31
+    crictl_version: v1.30.1

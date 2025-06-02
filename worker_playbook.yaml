@@ -1,0 +1,233 @@
+---
+- name: Playbook for creating new worker to Kubernetes cluster
+  hosts: worker3
+  become: yes
+
+  vars:
+    centos_version: 9
+    kubetools_version: 1.31.7
+    kuber_repo_version: "v1.31"
+
+  tasks:
+
+  - name: Swap
+    block:
+      - name: Look at free
+        ansible.builtin.command: free -m
+        register: swap_is
+        changed_when: false
+
+      - name: Check swap
+        ansible.builtin.command: swapoff -a
+        when: swap_is.stdout is search('Swap:\s+[1-9]')
+
+      - name: Remove swap entries from /etc/fstab
+        ansible.builtin.lineinfile:
+          path: /etc/fstab
+          regexp: '^\s*[^#]+\s+swap\s+'
+          state: absent
+
+  - name: Install Kubernetes and containerd dependencies
+    block:
+      - name: Add Kubernetes repo
+        ansible.builtin.copy:
+          dest: /etc/yum.repos.d/kubernetes.repo
+          content: |
+            [kubernetes]
+            name=Kubernetes
+            baseurl=https://pkgs.k8s.io/core:/stable:/v1.31/rpm/
+            enabled=1
+            gpgcheck=1
+            repo_gpgcheck=1
+            gpgkey=https://pkgs.k8s.io/core:/stable:/v1.31/rpm/repodata/repomd.xml.key
+            exclude=kubelet kubeadm kubectl cri-tools
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Add repo for containerd
+        ansible.builtin.get_url:
+          url: https://download.docker.com/linux/centos/docker-ce.repo
+          dest: /etc/yum.repos.d/docker-ce.repo
+
+      - name: Replace $releasever with specific CentOS version
+        ansible.builtin.replace:
+          path: /etc/yum.repos.d/docker-ce.repo
+          regexp: '\$releasever'
+          replace: '{{ centos_version }}'
+
+      - name: Install kubelet, kubeadm, kubectl
+        ansible.builtin.yum:
+          name:
+            - kubelet-{{ kubetools_version }}
+            - kubeadm-{{ kubetools_version }}
+            - kubectl-{{ kubetools_version }}
+          state: present
+          disable_excludes: kubernetes
+
+      - name: Install additional tools
+        ansible.builtin.yum:
+          name:
+            - curl
+            - wget
+            - tar
+            - jq
+            - yum-utils
+            - device-mapper-persistent-data
+            - lvm2
+            - containerd.io
+          state: present
+
+  - name: Download and install crictl v1.30.1
+    block:
+      - name: Check if crictl is installed
+        ansible.builtin.stat:
+          path: /usr/bin/crictl
+        register: crictl_stat
+
+      - name: Download crictl v1.30.1 if not already installed
+        ansible.builtin.get_url:
+          url: https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.30.1/crictl-v1.30.1-linux-amd64.tar.gz
+          dest: /tmp/crictl-v1.30.1-linux-amd64.tar.gz
+          mode: '0644'
+        when: not crictl_stat.stat.exists
+
+      - name: Extract crictl tar to /usr/bin
+        ansible.builtin.unarchive:
+          src: /tmp/crictl-v1.30.1-linux-amd64.tar.gz
+          dest: /usr/bin/
+          remote_src: yes
+          mode: '0755'
+        when: not crictl_stat.stat.exists
+
+      - name: Clean up crictl tar file
+        ansible.builtin.file:
+          path: /tmp/crictl-v1.30.1-linux-amd64.tar.gz
+          state: absent
+        when: not crictl_stat.stat.exists
+
+  - name: Configure kernel modules and sysctl
+    block:
+      - name: Setting core modules
+        ansible.builtin.copy:
+          dest: /etc/modules-load.d/containerd.conf
+          content: |
+            overlay
+            br_netfilter
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Load overlay module
+        ansible.builtin.modprobe:
+          name: overlay
+          state: present
+
+      - name: Load br_netfilter module
+        ansible.builtin.modprobe:
+          name: br_netfilter
+          state: present
+
+      - name: Configure sysctl parameters
+        ansible.builtin.copy:
+          dest: /etc/sysctl.d/99-kubernetes-cri.conf
+          content: |
+            net.bridge.bridge-nf-call-iptables = 1
+            net.ipv4.ip_forward = 1
+            net.bridge.bridge-nf-call-ip6tables = 1
+            net.ipv6.conf.all.forwarding = 1
+          owner: root
+          group: root
+          mode: '0644'
+        notify: Reload all sysctl settings
+
+      - name: Flush handlers if sysctl config is changed
+        meta: flush_handlers
+
+  - name: Configure containerd
+    block:
+      - name: Create containerd directory if missing
+        ansible.builtin.file:
+          path: /etc/containerd
+          state: directory
+          mode: '0755'
+
+      - name: Generate new containerd config
+        ansible.builtin.shell: containerd config default > /etc/containerd/config.toml
+        args:
+          creates: /etc/containerd/config.toml
+
+      - name: Set SystemdCgroup to true
+        ansible.builtin.replace:
+          path: /etc/containerd/config.toml
+          regexp: 'SystemdCgroup = false'
+          replace: 'SystemdCgroup = true'
+
+      - name: Configure CRI endpoint
+        ansible.builtin.copy:
+          dest: /etc/crictl.yaml
+          content: |
+            runtime-endpoint: unix:///run/containerd/containerd.sock
+          owner: root
+          group: root
+          mode: '0644'
+
+  - name: Enable and start systemd services
+    block:
+      - name: Force systemd daemon reload
+        ansible.builtin.systemd:
+          daemon_reload: true
+
+      - name: Enable and start kubelet and containerd services
+        ansible.builtin.systemd:
+          name: "{{ item }}"
+          enabled: true
+          state: started
+        loop:
+          - containerd
+          - kubelet
+
+      - name: Disable firewalld
+        ansible.builtin.systemd:
+          name: firewalld
+          enabled: false
+          state: stopped
+
+  - name: Define worker membership
+    block:
+
+      - name: Install pip
+        ansible.builtin.yum:
+          name:
+            - pip
+          state: present
+        delegate_to: master
+
+      - name: Install Kubernetes pip
+        ansible.builtin.pip:
+          name: kubernetes==32.0.1
+        delegate_to: master
+
+      - name: Fetch nodes information from Kubernetes
+        community.kubernetes.k8s_info:
+          kind: Node
+        register: nodes_info
+        delegate_to: master
+        become: false
+
+  - name: Check worker membership
+    block:
+      - name: Get the list of node names
+        set_fact:
+          node_names: "{{ nodes_info.resources | map(attribute='metadata.name') | list }}"
+
+      - name: Check if the node is added to the Kubernetes cluster
+        ansible.builtin.shell: sudo kubeadm join 192.168.31.100:8443 --token isowk6.occcnhdvj1a1rtj6 --discovery-token-ca-cert-hash sha256:b1511af9e507f107f5066f572506d5a7cf4f7d31f107cd56e52987acdf2ce394
+        when: ansible_hostname not in node_names
+
+  handlers:
+
+  - name: Reload all sysctl settings
+    ansible.builtin.command: sysctl --system
+
+

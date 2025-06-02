@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: MIT-0
+---
+# tasks file for downscale
+
+- name: Define membership parameters
+  block:
+
+    - name: Install pip
+      ansible.builtin.yum:
+        name: pip
+        state: present
+      delegate_to: endpoint_master
+
+    - name: Install Kubernetes pip
+      ansible.builtin.pip:
+        name: kubernetes==32.0.1
+      delegate_to: endpoint_master
+
+- name: Fetch current cluster node list
+  block:
+
+    - name: Fetch nodes information from Kubernetes
+      community.kubernetes.k8s_info:
+        kind: Node
+      register: nodes_info
+      delegate_to: endpoint_master
+      become: true
+      become_method: sudo
+      become_user: "{{ kuber_user }}"
+      become_flags: '-i'
+      ignore_errors: true
+
+    - name: Extract node names
+      set_fact:
+        node_names: "{{ nodes_info.resources | map(attribute='metadata.name') | list }}"
+
+- name: Remove node if it's part of the cluster
+  block:
+
+    - name: Drain the node (optional but recommended)
+      ansible.builtin.shell: |
+        kubectl drain {{ ansible_hostname }} \
+          --ignore-daemonsets --delete-emptydir-data --force
+      become: true
+      become_method: sudo
+      become_user: "{{ kuber_user }}"
+      become_flags: '-i'
+      ignore_errors: true
+      delegate_to: endpoint_master
+
+    - name: Delete node from the Kubernetes cluster
+      ansible.builtin.shell: kubectl delete node {{ ansible_hostname }}
+      become: true
+      become_method: sudo
+      become_user: "{{ kuber_user }}"
+      become_flags: '-i'
+      ignore_errors: true
+      delegate_to: endpoint_master
+
+    - name: Wipe Kubernetes config and state from node
+      ansible.builtin.shell: |
+        kubeadm reset --force
+        rm -rf /etc/cni /etc/kubernetes /var/lib/etcd /var/lib/kubelet /etc/containerd
+        iptables -F
+        iptables -t nat -F
+        iptables -t mangle -F
+        iptables -X
+        ipvsadm --clear || true
+      args:
+        executable: /bin/bash
+
+  when: ansible_hostname in node_names
+
+- name: Continue if node is master
+  block:
+
+    - name: Get etcd member list
+      command: >
+        etcdctl member list
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt
+        --cert=/etc/kubernetes/pki/etcd/server.crt
+        --key=/etc/kubernetes/pki/etcd/server.key
+      register: etcd_members
+      delegate_to: endpoint_master
+
+    - name: Parse etcd member ID to remove
+      set_fact:
+        etcd_member_id: "{{ item.split(',')[0] }}"
+      loop: "{{ etcd_members.stdout_lines }}"
+      when: ansible_hostname in item
+
+
+    - name: Remove etcd member
+      command: >
+        etcdctl member remove {{ etcd_member_id }}
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt
+        --cert=/etc/kubernetes/pki/etcd/server.crt
+        --key=/etc/kubernetes/pki/etcd/server.key
+      when: etcd_member_id is defined
+      delegate_to: endpoint_master
+
+  when: 
+    - ansible_hostname in node_names
+    - node_type == 'master'
+
+
+- name: Remove .kube/config file
+  ansible.builtin.file:
+    path: "/home/{{ kuber_user }}/.kube/config"
+    state: absent
+  when:
+    - node_type == "master"
+
+- name: Remove .kube directory
+  ansible.builtin.file:
+    path: "/home/{{ kuber_user }}/.kube"
+    state: absent
+  when:
+    - node_type == "master"
+

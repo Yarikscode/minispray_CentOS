@@ -1,0 +1,131 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for worker_scale
+
+  - name: Run role install_env_kubernetes
+    import_role:
+      name: install_env_kubernetes
+
+  - name: Define membership parametrs
+    block:
+
+      - name: Install pip
+        ansible.builtin.yum:
+          name:
+            - pip
+          state: present
+        delegate_to: endpoint_master
+
+      - name: Install Kubernetes pip
+        ansible.builtin.pip:
+          name: kubernetes==32.0.1
+        delegate_to: endpoint_master
+
+  - name: Check host membership
+    block:
+
+      - name: Fetch nodes information from Kubernetes
+        community.kubernetes.k8s_info:
+          kind: Node
+        register: nodes_info
+        delegate_to: endpoint_master
+        become: true
+        become_method: sudo
+        become_user: "{{ kuber_user }}"
+        become_flags: '-i'
+
+      - name: Get the list of node names
+        set_fact:
+          node_names: "{{ nodes_info.resources | map(attribute='metadata.name') | list }}"
+
+
+      - name: Create kubeadm token
+        ansible.builtin.command: kubeadm token create --ttl 15m
+        register: kubeadm_token
+        delegate_to: endpoint_master
+        when: ansible_hostname not in node_names
+
+
+  - name: Join new member
+    block:
+      - name: Get CA cert hash
+        ansible.builtin.shell: |
+          openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt |
+          openssl rsa -pubin -outform der 2>/dev/null |
+          openssl dgst -sha256 -hex |
+          awk '{print $2}'
+        register: ca_cert_hash
+        delegate_to: endpoint_master
+        when: ansible_hostname not in node_names
+
+      - name: Join worker node
+        ansible.builtin.shell: |
+          kubeadm join {{ endpoint_ip }}:{{ endpoint_port }} \
+            --token {{ kubeadm_token.stdout }} \
+            --discovery-token-ca-cert-hash sha256:{{ ca_cert_hash.stdout }}
+        when: 
+          - ansible_hostname not in node_names
+          - node_type == "worker"
+
+
+      - name: Upload control plane certificates
+        shell: |
+          {{ bin_dir }}/kubeadm init phase upload-certs --upload-certs
+        args:
+          executable: /bin/bash
+        delegate_to: endpoint_master
+        register: kubeadm_upload_cert
+        when:
+          - node_type == "master"
+          - ansible_hostname not in node_names
+
+      - name: Debug current certificate key
+        debug:
+          var: kubeadm_upload_cert
+
+
+      - name: Set fact 'kubeadm_certificate_key' for later use
+        set_fact:
+          kubeadm_certificate_key: "{{ kubeadm_upload_cert.stdout_lines[-1] | trim }}"
+        when: 
+          - node_type == "master"
+          - ansible_hostname not in node_names  
+
+      - name: Debug current certificate key2
+        debug:
+          var: kubeadm_certificate_key
+
+
+      - name: Join master node
+        ansible.builtin.shell: |
+          kubeadm join {{ endpoint_ip }}:{{ endpoint_port }} \
+            --token {{ kubeadm_token.stdout }} \
+            --discovery-token-ca-cert-hash sha256:{{ ca_cert_hash.stdout }} \
+            --control-plane --certificate-key {{ kubeadm_certificate_key }}
+        when:
+          - ansible_hostname not in node_names
+          - node_type == "master"
+
+
+      - name: Ensure .kube directory exists
+        file:
+          path: "/home/{{ kuber_user }}/.kube"
+          state: directory
+          owner: "{{ kuber_user }}"
+          group: "{{ kuber_user }}"
+          mode: '0700'
+
+
+      - name: Copy kubeconfig to user
+        ansible.builtin.copy:
+          src: /etc/kubernetes/admin.conf
+          dest: /home/{{ kuber_user }}/.kube/config
+          owner: "{{ kuber_user }}"
+          group: "{{ kuber_user }}"
+          mode: '0600'
+          remote_src: true
+        when:
+          - node_type == "master"
+
+
+

@@ -1,0 +1,184 @@
+# tasks file for install_env_kubernetes
+---
+  - name: Swap
+    block:
+      - name: Look at free
+        ansible.builtin.command: free -m
+        register: swap_is
+        changed_when: false
+
+      - name: Check swap
+        ansible.builtin.command: swapoff -a
+        when: swap_is.stdout is search('Swap:\s+[1-9]')
+
+      - name: Remove swap entries from /etc/fstab
+        ansible.builtin.lineinfile:
+          path: /etc/fstab
+          regexp: '^\s*[^#]+\s+swap\s+'
+          state: absent
+
+  - name: Install Kubernetes and containerd dependencies
+    block:
+      - name: Add Kubernetes repo
+        ansible.builtin.template:
+          src: kubernetes.repo.j2
+          dest: /etc/yum.repos.d/kubernetes.repo
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Add repo for containerd
+        ansible.builtin.get_url:
+          url: https://download.docker.com/linux/centos/docker-ce.repo
+          dest: /etc/yum.repos.d/docker-ce.repo
+
+      - name: Replace $releasever with specific CentOS version
+        ansible.builtin.replace:
+          path: /etc/yum.repos.d/docker-ce.repo
+          regexp: '\$releasever'
+          replace: '{{ centos_version }}'
+
+      - name: Install kubelet, kubeadm, kubectl
+        ansible.builtin.yum:
+          name:
+            - kubelet-{{ kubetools_version }}
+            - kubeadm-{{ kubetools_version }}
+            - kubectl-{{ kubetools_version }}
+          state: present
+          disable_excludes: kubernetes
+
+      - name: Install additional tools
+        ansible.builtin.yum:
+          name:
+            - curl
+            - wget
+            - tar
+            - jq
+            - yum-utils
+            - device-mapper-persistent-data
+            - lvm2
+            - containerd.io
+          state: present
+
+  - name: Download and install crictl {{ crictl_version }}
+    block:
+      - name: Check if crictl is installed
+        ansible.builtin.stat:
+          path: /usr/bin/crictl
+        register: crictl_stat
+
+      - name: Download crictl {{ crictl_version }} if not already installed
+        ansible.builtin.get_url:
+          url: https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ crictl_version }}/crictl-{{ crictl_version }}-linux-amd64.tar.gz
+          dest: /tmp/crictl-{{ crictl_version }}-linux-amd64.tar.gz
+          mode: '0644'
+        when: not crictl_stat.stat.exists
+
+      - name: Extract crictl tar to /usr/bin
+        ansible.builtin.unarchive:
+          src: /tmp/crictl-{{ crictl_version }}-linux-amd64.tar.gz
+          dest: /usr/bin/
+          remote_src: yes
+          mode: '0755'
+        when: not crictl_stat.stat.exists
+
+      - name: Clean up crictl tar file
+        ansible.builtin.file:
+          path: /tmp/crictl-{{ crictl_version }}-linux-amd64.tar.gz
+          state: absent
+        when: not crictl_stat.stat.exists
+
+  - name: Configure kernel modules and sysctl
+    block:
+      - name: Setting core modules
+        ansible.builtin.copy:
+          dest: /etc/modules-load.d/containerd.conf
+          content: |
+            overlay
+            br_netfilter
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Load overlay module
+        ansible.builtin.modprobe:
+          name: overlay
+          state: present
+
+      - name: Load br_netfilter module
+        ansible.builtin.modprobe:
+          name: br_netfilter
+          state: present
+
+      - name: Configure sysctl parameters
+        ansible.builtin.template:
+          src: kubernetes-cri.conf.j2
+          dest: /etc/sysctl.d/99-kubernetes-cri.conf
+          owner: root
+          group: root
+          mode: '0644'
+        notify: Reload all sysctl settings
+
+
+      - name: Flush handlers if sysctl config is changed
+        meta: flush_handlers
+
+  - name: Configure containerd
+    block:
+      - name: Create containerd directory if missing
+        ansible.builtin.file:
+          path: /etc/containerd
+          state: directory
+          mode: '0755'
+
+      - name: Generate new containerd config
+        ansible.builtin.shell: containerd config default > /etc/containerd/config.toml
+        args:
+          creates: /etc/containerd/config.toml
+
+      - name: Replace pause version in containerd config
+        ansible.builtin.replace:
+          path: /etc/containerd/config.toml
+          regexp: 'sandbox_image = ".*"'
+          replace: 'sandbox_image = "registry.k8s.io/pause:3.10"'
+
+      - name: Set SystemdCgroup to true
+        ansible.builtin.replace:
+          path: /etc/containerd/config.toml
+          regexp: 'SystemdCgroup = false'
+          replace: 'SystemdCgroup = true'
+
+      - name: Configure CRI endpoint
+        ansible.builtin.copy:
+          dest: /etc/crictl.yaml
+          content: |
+            runtime-endpoint: unix:///run/containerd/containerd.sock
+          owner: root
+          group: root
+          mode: '0644'
+    notify: Reload containerd and kubelet configs
+
+  - name: Immediately restart containerd and kubelet
+    meta: flush_handlers
+          
+  - name: Enable and start systemd services
+    block:
+      - name: Force systemd daemon reload
+        ansible.builtin.systemd:
+          daemon_reload: true
+
+      - name: Enable and start kubelet and containerd services
+        ansible.builtin.systemd:
+          name: "{{ item }}"
+          enabled: true
+          state: started
+        loop:
+          - containerd
+          - kubelet
+
+      - name: Disable firewalld
+        ansible.builtin.systemd:
+          name: firewalld
+          enabled: false
+          state: stopped
+
