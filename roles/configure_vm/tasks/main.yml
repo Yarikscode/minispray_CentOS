@@ -1,0 +1,60 @@
+---
+- name: Create user {{ username }} with sudo
+  ansible.builtin.user:
+    name: "{{ username }}"
+    shell: /bin/bash
+    groups: wheel
+    append: yes
+    state: present
+
+- name: Configure SSH
+  block:
+    - name: Ensure .ssh directory exists
+      file:
+        path: "/home/{{ username }}/.ssh"
+        state: directory
+        owner: "{{ username }}"
+        group: "{{ username }}"
+        mode: '0700'
+
+    - name: Deploy authorized_keys from template
+      ansible.builtin.template:
+        src: authorized_keys.j2
+        dest: "/home/{{ username }}/.ssh/authorized_keys"
+        owner: "{{ username }}"
+        group: "{{ username }}"
+        mode: '0600'
+
+    - name: Deploy sshd override config
+      ansible.builtin.template:
+        src: 50-redhat.conf.j2
+        dest: /etc/ssh/sshd_config.d/50-redhat.conf
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Ensure PubkeyAuthentication is enabled
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PubkeyAuthentication\s+.*'
+        line: 'PubkeyAuthentication yes'
+        state: present
+        backup: yes
+
+    - name: Ensure correct AuthorizedKeysFile path
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*AuthorizedKeysFile\s+.*'
+        line: 'AuthorizedKeysFile  .ssh/authorized_keys'
+        state: present
+        backup: yes
+
+    - name: Restart SSH service
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+- name: Set hostname
+  ansible.builtin.hostname:
+    name: "{{ dns_name }}"
+
